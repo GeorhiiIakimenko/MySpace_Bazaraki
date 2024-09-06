@@ -108,7 +108,10 @@ def scrape_listing(url):
     response = requests.get(url, headers=headers)
     soup = BeautifulSoup(response.content, 'html.parser')
 
-    city = soup.select_one('.announcement-meta--single span')
+    # Обновленный селектор для города
+    city = soup.select_one('span[itemprop="address"]')
+    if not city:
+        city = soup.select_one('.announcement-meta--single span')
     city = clean_text(city.text) if city else "Not found"
     logging.info(f"City: {city}")
 

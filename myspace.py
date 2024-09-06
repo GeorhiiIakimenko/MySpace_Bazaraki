@@ -14,6 +14,9 @@ import logging
 import random
 import schedule
 import threading
+import os
+import json
+
 
 # Enhanced Logging setup
 logging.basicConfig(level=logging.INFO,
@@ -29,8 +32,12 @@ bot = telebot.TeleBot(TOKEN)
 
 # Google Sheets setup
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
-SERVICE_ACCOUNT_FILE = 'boxwood-chalice-422009-j8-02152d6b48e7.json'
-creds = ServiceAccountCredentials.from_json_keyfile_name(SERVICE_ACCOUNT_FILE, SCOPES)
+
+# Получаем содержимое JSON из переменной окружения
+service_account_info = json.loads(os.getenv('GOOGLE_APPLICATION_CREDENTIALS_JSON', '{}'))
+
+# Используем содержимое для создания учетных данных
+creds = ServiceAccountCredentials.from_dict(service_account_info, scopes=SCOPES)
 client = gspread.authorize(creds)
 
 # Open the Google Spreadsheet

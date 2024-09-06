@@ -1,7 +1,8 @@
 import telebot
 import time
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
+from google.auth.transport.requests import Request
 import re
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -37,7 +38,13 @@ SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 service_account_info = json.loads(os.getenv('GOOGLE_APPLICATION_CREDENTIALS_JSON', '{}'))
 
 # Используем содержимое для создания учетных данных
-creds = ServiceAccountCredentials.from_dict(service_account_info, scopes=SCOPES)
+creds = Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
+
+# Если учетные данные устарели, обновляем их
+if creds and creds.expired and creds.refresh_token:
+    creds.refresh(Request())
+
+# Создаем клиент gspread
 client = gspread.authorize(creds)
 
 # Open the Google Spreadsheet

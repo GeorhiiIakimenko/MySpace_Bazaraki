@@ -1,3 +1,4 @@
+from gspread.exceptions import APIError
 import os
 import json
 import telebot
@@ -11,7 +12,6 @@ from bs4 import BeautifulSoup
 import logging
 import random
 import schedule
-from gspread.exceptions import APIError
 
 
 
@@ -245,24 +245,38 @@ Link: {apartment['url']}
             logging.error(f"Error sending message: {e}", exc_info=True)
 
 
+# Глобальная переменная для хранения chat_id
+CHAT_ID = None
+
+
 def periodic_check():
+    global CHAT_ID
     logging.info("Starting periodic check")
+    if CHAT_ID is None:
+        logging.warning("No chat ID available. Skipping notifications.")
+        return
+
     apartments = scrape_bazaraki(max_listings=100)
     if apartments:
         new_apartments = update_sheet(apartments)
         if new_apartments:
             logging.info(f"Found {len(new_apartments)} new objects out of {len(apartments)} checked.")
-            # Здесь вы можете добавить код для отправки уведомлений, если это необходимо
+            send_telegram_notifications(CHAT_ID, new_apartments)
         else:
             logging.info(f"No new real estate objects found out of {len(apartments)} checked.")
+            bot.send_message(CHAT_ID, "No new real estate objects found in the periodic check.")
     else:
         logging.error("Failed to retrieve real estate information.")
+        bot.send_message(CHAT_ID, "Failed to retrieve real estate information in the periodic check.")
     logging.info("Periodic check completed")
 
 
 @bot.message_handler(commands=['start'])
 def handle_start(message):
-    logging.info(f"Received /start command from user {message.from_user.id}")
+    global CHAT_ID
+    CHAT_ID = message.chat.id
+    logging.info(f"Received /start command. Chat ID set to {CHAT_ID}")
+
     bot.reply_to(message, "Starting the search for real estate objects (checking up to 100 listings)...")
     apartments = scrape_bazaraki(max_listings=100)
     if apartments:
@@ -270,13 +284,12 @@ def handle_start(message):
         if new_apartments:
             bot.reply_to(message,
                          f"Found {len(new_apartments)} new objects out of {len(apartments)} checked. Sending information...")
-            send_telegram_notifications(message.chat.id, new_apartments)
+            send_telegram_notifications(CHAT_ID, new_apartments)
         else:
             bot.reply_to(message, f"No new real estate objects found out of {len(apartments)} checked.")
     else:
         bot.reply_to(message, "Failed to retrieve real estate information. Please try again later.")
-    bot.reply_to(message, "Search completed. The bot will now check for updates every 10 hours.")
-    logging.info("Completed processing /start command")
+    bot.reply_to(message, "Search completed. The bot will now check for updates every 10 hours and send messages here.")
 
 
 def run_scheduled_checks():
@@ -287,14 +300,14 @@ def run_scheduled_checks():
 
 
 def run_bot():
-    import threading
+    global CHAT_ID
     logging.info("Starting scheduled checks")
-    check_thread = threading.Thread(target=run_scheduled_checks)
-    check_thread.start()
+    schedule.every(4).hours.do(periodic_check)
 
     while True:
         try:
             logging.info("Starting bot polling...")
+            schedule.run_pending()
             bot.polling(none_stop=True, timeout=60, long_polling_timeout=30)
         except Exception as e:
             logging.error(f"Error in bot polling: {e}", exc_info=True)

@@ -12,7 +12,7 @@ import logging
 import random
 import schedule
 import sys
-from requests.exceptions import RequestException, Timeout
+from threading import Thread
 
 # Enhanced Logging setup
 logging.basicConfig(level=logging.INFO,
@@ -43,6 +43,9 @@ client = gspread.authorize(creds)
 
 # Open the Google Spreadsheet
 sheet = client.open_by_key('1bzbds-U64u9maqxquzeysUNKgC8dgPbMSHaoEHDnfW8').sheet1
+
+# Глобальная переменная для хранения chat_id
+CHAT_ID = None
 
 def clean_text(text):
     return re.sub(r'\s+', ' ', text).strip()
@@ -204,30 +207,10 @@ def update_sheet(apartments):
     logging.info(f"Updated sheet with {len(new_apartments)} new apartments")
     return new_apartments
 
-def retry_with_backoff(func, max_retries=5, initial_delay=1, max_delay=60):
-    def wrapper(*args, **kwargs):
-        retries = 0
-        delay = initial_delay
-        while retries < max_retries:
-            try:
-                return func(*args, **kwargs)
-            except (RequestException, Timeout) as e:
-                retries += 1
-                if retries == max_retries:
-                    raise e
-                sleep_time = min(delay * (2 ** retries), max_delay)
-                logging.warning(f"Request failed. Retrying in {sleep_time} seconds...")
-                time.sleep(sleep_time)
-    return wrapper
-
-@retry_with_backoff
-def send_telegram_message(chat_id, text):
-    return bot.send_message(chat_id=chat_id, text=text)
-
 def send_telegram_notifications(chat_id, new_apartments):
     logging.info(f"Sending Telegram notifications for {len(new_apartments)} apartments")
     if not new_apartments:
-        send_telegram_message(chat_id, "No new real estate objects found.")
+        bot.send_message(chat_id=chat_id, text="No new real estate objects found.")
         logging.info("No new apartments to notify about")
         return
 
@@ -242,87 +225,92 @@ Area: {apartment['area']}
 Link: {apartment['url']}
 """
         try:
-            send_telegram_message(chat_id, message)
+            bot.send_message(chat_id=chat_id, text=message)
             logging.info(f"Sent notification for apartment: {apartment['url']}")
             time.sleep(1)
         except Exception as e:
             logging.error(f"Error sending message: {e}", exc_info=True)
 
-# Глобальная переменная для хранения chat_id
-CHAT_ID = None
-
-def periodic_check():
+def restart_and_check():
+    logging.info("Выполняется ежечасная проверка и перезапуск")
     global CHAT_ID
-    logging.info("Starting periodic check")
-    if CHAT_ID is None:
-        logging.warning("No chat ID available. Skipping notifications.")
-        return
-
-    apartments = scrape_bazaraki(max_listings=100)
-    if apartments:
-        new_apartments = update_sheet(apartments)
-        if new_apartments:
-            logging.info(f"Found {len(new_apartments)} new objects out of {len(apartments)} checked.")
-            send_telegram_notifications(CHAT_ID, new_apartments)
+    if CHAT_ID is not None:
+        apartments = scrape_bazaraki(max_listings=100)
+        if apartments:
+            new_apartments = update_sheet(apartments)
+            if new_apartments:
+                logging.info(f"Найдено {len(new_apartments)} новых объектов из {len(apartments)} проверенных.")
+                send_telegram_notifications(CHAT_ID, new_apartments)
+            else:
+                logging.info(f"Новых объектов недвижимости не найдено из {len(apartments)} проверенных.")
+                bot.send_message(CHAT_ID, "Новых объектов недвижимости не найдено при ежечасной проверке.")
         else:
-            logging.info(f"No new real estate objects found out of {len(apartments)} checked.")
-            send_telegram_message(CHAT_ID, "No new real estate objects found in the periodic check.")
+            logging.error("Не удалось получить информацию о недвижимости.")
+            bot.send_message(CHAT_ID, "Не удалось получить информацию о недвижимости при ежечасной проверке.")
     else:
-        logging.error("Failed to retrieve real estate information.")
-        send_telegram_message(CHAT_ID, "Failed to retrieve real estate information in the periodic check.")
-    logging.info("Periodic check completed")
+        logging.warning("CHAT_ID не установлен. Невозможно выполнить ежечасную проверку")
+    
+    save_chat_id()
+    logging.info("Инициирую перезапуск бота...")
+    os.execv(sys.executable, ['python'] + sys.argv)
 
 @bot.message_handler(commands=['start'])
 def handle_start(message):
     global CHAT_ID
     CHAT_ID = message.chat.id
-    logging.info(f"Received /start command. Chat ID set to {CHAT_ID}")
+    logging.info(f"Получена команда /start. CHAT_ID установлен на {CHAT_ID}")
+    save_chat_id()
 
-    bot.reply_to(message, "Starting the search for real estate objects (checking up to 100 listings)...")
+    bot.reply_to(message, "Начинаю поиск объектов недвижимости (проверяю до 100 объявлений)...")
     apartments = scrape_bazaraki(max_listings=100)
     if apartments:
         new_apartments = update_sheet(apartments)
         if new_apartments:
             bot.reply_to(message,
-                         f"Found {len(new_apartments)} new objects out of {len(apartments)} checked. Sending information...")
+                         f"Найдено {len(new_apartments)} новых объектов из {len(apartments)} проверенных. Отправляю информацию...")
             send_telegram_notifications(CHAT_ID, new_apartments)
         else:
-            bot.reply_to(message, f"No new real estate objects found out of {len(apartments)} checked.")
+            bot.reply_to(message, f"Новых объектов недвижимости не найдено из {len(apartments)} проверенных.")
     else:
-        bot.reply_to(message, "Failed to retrieve real estate information. Please try again later.")
-    bot.reply_to(message, "Search completed. The bot will now check for updates every 10 hours and send messages here.")
+        bot.reply_to(message, "Не удалось получить информацию о недвижимости. Пожалуйста, попробуйте позже.")
+    bot.reply_to(message, "Поиск завершен. Бот будет проверять обновления каждый час и отправлять сообщения сюда.")
 
-def restart_program():
-    logging.info("Restarting the bot...")
-    os.execl(sys.executable, sys.executable, *sys.argv)
+def save_chat_id():
+    if CHAT_ID:
+        with open("chat_id.txt", "w") as f:
+            f.write(str(CHAT_ID))
+
+def load_chat_id():
+    global CHAT_ID
+    try:
+        with open("chat_id.txt", "r") as f:
+            CHAT_ID = int(f.read().strip())
+    except FileNotFoundError:
+        CHAT_ID = None
+
+def run_scheduler():
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
 
 def run_bot():
-    global CHAT_ID
-    logging.info("Starting scheduled checks")
-    schedule.every(4).hours.do(periodic_check)
-    schedule.every(2).hours.do(restart_program)
+    load_chat_id()
+    logging.info("Запуск планировщика задач")
+    schedule.every().hour.at(":59").do(restart_and_check)
 
-    start_time = time.time()
+    # Запускаем планировщик в отдельном потоке
+    scheduler_thread = Thread(target=run_scheduler)
+    scheduler_thread.daemon = True
+    scheduler_thread.start()
 
     while True:
         try:
-            logging.info("Starting bot polling...")
-            schedule.run_pending()
-            bot.polling(none_stop=True, timeout=30, long_polling_timeout=15)
-        except requests.exceptions.ReadTimeout:
-            logging.warning("Read timeout occurred. Restarting polling...")
-            continue
-        except requests.exceptions.ConnectionError:
-            logging.error("Connection error occurred. Waiting before retry...")
-            time.sleep(15)
+            logging.info("Начинаю опрос бота...")
+            bot.polling(none_stop=True, timeout=3540)  # ~59 минут
         except Exception as e:
-            logging.error(f"Unexpected error in bot polling: {e}", exc_info=True)
+            logging.error(f"Ошибка при опросе бота: {e}", exc_info=True)
             time.sleep(15)
-        
-        # Проверяем, прошло ли 2 часа с момента запуска
-        if time.time() - start_time > 7200:  # 7200 секунд = 2 часа
-            restart_program()
 
 if __name__ == "__main__":
-    logging.info("Starting Bazaraki Real Estate Bot (100 listings, checks every 10 hours, restarts every 2 hours)")
+    logging.info("Запуск Bazaraki Real Estate Bot (проверка 100 объявлений и перезапуск каждый час)")
     run_bot()

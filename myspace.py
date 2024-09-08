@@ -1,4 +1,3 @@
-from gspread.exceptions import APIError
 import os
 import json
 import telebot
@@ -12,8 +11,8 @@ from bs4 import BeautifulSoup
 import logging
 import random
 import schedule
-
-
+import sys
+from requests.exceptions import RequestException, Timeout
 
 # Enhanced Logging setup
 logging.basicConfig(level=logging.INFO,
@@ -35,13 +34,6 @@ service_account_info = json.loads(os.getenv('GOOGLE_APPLICATION_CREDENTIALS_JSON
 
 # Используем содержимое для создания учетных данных
 creds = Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
-client = gspread.authorize(creds)
-
-# Open the Google Spreadsheet
-sheet = client.open_by_key('1bzbds-U64u9maqxquzeysUNKgC8dgPbMSHaoEHDnfW8').sheet1
-
-# Используем содержимое для создания учетных данных
-creds = Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
 
 # Если учетные данные устарели, обновляем их
 if creds and creds.expired and creds.refresh_token:
@@ -52,17 +44,14 @@ client = gspread.authorize(creds)
 # Open the Google Spreadsheet
 sheet = client.open_by_key('1bzbds-U64u9maqxquzeysUNKgC8dgPbMSHaoEHDnfW8').sheet1
 
-
 def clean_text(text):
     return re.sub(r'\s+', ' ', text).strip()
-
 
 def create_column_headers():
     headers = ["City", "Price", "Rooms", "Bathrooms", "Area", "URL"]
     if sheet.row_values(1) != headers:
         sheet.insert_row(headers, 1)
         logging.info("Column headers created in Google Sheets")
-
 
 def get_listing_urls(max_listings=100):
     urls = []
@@ -99,7 +88,6 @@ def get_listing_urls(max_listings=100):
     logging.info(f"Collected a total of {len(urls)} listing URLs")
     return urls
 
-
 def scrape_listing(url):
     logging.info(f"Scraping listing: {url}")
     headers = {
@@ -108,7 +96,6 @@ def scrape_listing(url):
     response = requests.get(url, headers=headers)
     soup = BeautifulSoup(response.content, 'html.parser')
 
-    # Обновленный селектор для города
     city = soup.select_one('span[itemprop="address"]')
     if not city:
         city = soup.select_one('.announcement-meta--single span')
@@ -139,7 +126,6 @@ def scrape_listing(url):
         'area': area,
         'url': url
     }
-
 
 def scrape_bazaraki(max_listings=100):
     logging.info(f"Starting Bazaraki scraping process (max listings: {max_listings})")
@@ -177,7 +163,6 @@ def scrape_bazaraki(max_listings=100):
     logging.info(f"Scraping completed. Total apartments scraped: {len(apartments)}")
     return apartments
 
-
 def update_sheet(apartments):
     logging.info("Updating Google Sheet")
     create_column_headers()
@@ -205,7 +190,7 @@ def update_sheet(apartments):
                 sheet.append_rows(rows_to_append)
                 logging.info(f"Added {len(rows_to_append)} new apartments to the sheet")
                 break
-            except APIError as e:
+            except gspread.exceptions.APIError as e:
                 if e.response.status_code == 429:
                     logging.warning("API quota exceeded. Waiting before retrying...")
                     time.sleep(60)  # Wait for 60 seconds before retrying
@@ -219,11 +204,30 @@ def update_sheet(apartments):
     logging.info(f"Updated sheet with {len(new_apartments)} new apartments")
     return new_apartments
 
+def retry_with_backoff(func, max_retries=5, initial_delay=1, max_delay=60):
+    def wrapper(*args, **kwargs):
+        retries = 0
+        delay = initial_delay
+        while retries < max_retries:
+            try:
+                return func(*args, **kwargs)
+            except (RequestException, Timeout) as e:
+                retries += 1
+                if retries == max_retries:
+                    raise e
+                sleep_time = min(delay * (2 ** retries), max_delay)
+                logging.warning(f"Request failed. Retrying in {sleep_time} seconds...")
+                time.sleep(sleep_time)
+    return wrapper
+
+@retry_with_backoff
+def send_telegram_message(chat_id, text):
+    return bot.send_message(chat_id=chat_id, text=text)
 
 def send_telegram_notifications(chat_id, new_apartments):
     logging.info(f"Sending Telegram notifications for {len(new_apartments)} apartments")
     if not new_apartments:
-        bot.send_message(chat_id=chat_id, text="No new real estate objects found.")
+        send_telegram_message(chat_id, "No new real estate objects found.")
         logging.info("No new apartments to notify about")
         return
 
@@ -238,16 +242,14 @@ Area: {apartment['area']}
 Link: {apartment['url']}
 """
         try:
-            bot.send_message(chat_id=chat_id, text=message)
+            send_telegram_message(chat_id, message)
             logging.info(f"Sent notification for apartment: {apartment['url']}")
             time.sleep(1)
         except Exception as e:
             logging.error(f"Error sending message: {e}", exc_info=True)
 
-
 # Глобальная переменная для хранения chat_id
 CHAT_ID = None
-
 
 def periodic_check():
     global CHAT_ID
@@ -264,12 +266,11 @@ def periodic_check():
             send_telegram_notifications(CHAT_ID, new_apartments)
         else:
             logging.info(f"No new real estate objects found out of {len(apartments)} checked.")
-            bot.send_message(CHAT_ID, "No new real estate objects found in the periodic check.")
+            send_telegram_message(CHAT_ID, "No new real estate objects found in the periodic check.")
     else:
         logging.error("Failed to retrieve real estate information.")
-        bot.send_message(CHAT_ID, "Failed to retrieve real estate information in the periodic check.")
+        send_telegram_message(CHAT_ID, "Failed to retrieve real estate information in the periodic check.")
     logging.info("Periodic check completed")
-
 
 @bot.message_handler(commands=['start'])
 def handle_start(message):
@@ -291,29 +292,37 @@ def handle_start(message):
         bot.reply_to(message, "Failed to retrieve real estate information. Please try again later.")
     bot.reply_to(message, "Search completed. The bot will now check for updates every 10 hours and send messages here.")
 
-
-def run_scheduled_checks():
-    schedule.every(10).hours.do(periodic_check)
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
-
+def restart_program():
+    logging.info("Restarting the bot...")
+    os.execl(sys.executable, sys.executable, *sys.argv)
 
 def run_bot():
     global CHAT_ID
     logging.info("Starting scheduled checks")
     schedule.every(4).hours.do(periodic_check)
+    schedule.every(2).hours.do(restart_program)
+
+    start_time = time.time()
 
     while True:
         try:
             logging.info("Starting bot polling...")
             schedule.run_pending()
-            bot.polling(none_stop=True, timeout=60, long_polling_timeout=30)
-        except Exception as e:
-            logging.error(f"Error in bot polling: {e}", exc_info=True)
+            bot.polling(none_stop=True, timeout=30, long_polling_timeout=15)
+        except requests.exceptions.ReadTimeout:
+            logging.warning("Read timeout occurred. Restarting polling...")
+            continue
+        except requests.exceptions.ConnectionError:
+            logging.error("Connection error occurred. Waiting before retry...")
             time.sleep(15)
-
+        except Exception as e:
+            logging.error(f"Unexpected error in bot polling: {e}", exc_info=True)
+            time.sleep(15)
+        
+        # Проверяем, прошло ли 2 часа с момента запуска
+        if time.time() - start_time > 7200:  # 7200 секунд = 2 часа
+            restart_program()
 
 if __name__ == "__main__":
-    logging.info("Starting Bazaraki Real Estate Bot (100 listings, checks every 10 hours)")
+    logging.info("Starting Bazaraki Real Estate Bot (100 listings, checks every 10 hours, restarts every 2 hours)")
     run_bot()
